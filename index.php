@@ -162,6 +162,10 @@ function initDb(): void
         $db->exec("ALTER TABLE messages ADD COLUMN attachment_id TEXT");
     } catch (PDOException $e) {
     }
+    try {
+        $db->exec("ALTER TABLE messages ADD COLUMN reply_to_id INTEGER REFERENCES messages(id) ON DELETE SET NULL");
+    } catch (PDOException $e) {
+    }
     $db->exec("CREATE TABLE IF NOT EXISTS convos(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT DEFAULT 'dm',
@@ -323,6 +327,13 @@ function initDb(): void
     if (!in_array('font_id', $columnNames)) {
         $db->exec("ALTER TABLE users ADD COLUMN font_id INTEGER");
         $db->exec("UPDATE users SET font_id = 1");
+    }
+
+    // Add typing status tracking column
+    try {
+        $db->exec("ALTER TABLE convo_members ADD COLUMN last_typed_at TEXT");
+    } catch (PDOException $e) {
+        // Column likely exists
     }
 }
 
@@ -611,6 +622,22 @@ function checkBannedWords(string $text, int $userId): ?string
 function formatMessage(array $m, int $currentUserId): array
 {
     $body = decryptMessage($m['body_enc'], $m['nonce']);
+
+    // Decrypt reply body if exists
+    $replyData = null;
+    if (!empty($m['reply_to_id'])) {
+        $replyBody = null;
+        if (!empty($m['reply_body_enc']) && !empty($m['reply_nonce'])) {
+            $replyBody = decryptMessage($m['reply_body_enc'], $m['reply_nonce']);
+        }
+        $replyData = [
+            'id' => (int)$m['reply_to_id'],
+            'username' => $m['reply_username'] ?? 'Unknown',
+            'body' => $replyBody ?? '[Message deleted]',
+            'type' => $m['reply_type'] ?? 'text'
+        ];
+    }
+
     return [
         'id' => (int)$m['id'],
         'convo_id' => (int)$m['convo_id'],
@@ -623,7 +650,8 @@ function formatMessage(array $m, int $currentUserId): array
         'is_read_by_other' => (bool)($m['is_read_by_other'] ?? false),
         'is_mine' => (int)$m['user_id'] === $currentUserId,
         'type' => $m['type'] ?? 'text',
-        'attachment_id' => $m['attachment_id'] ?? null
+        'attachment_id' => $m['attachment_id'] ?? null,
+        'reply_to' => $replyData
     ];
 }
 
@@ -1185,10 +1213,17 @@ function handleApi(): void
         $stmt = $db->prepare("
             SELECT m.id, m.convo_id, m.user_id, m.body_enc, m.nonce, m.created_at, m.delivered_at, m.type, m.attachment_id,
                    u.username, u.is_verified,
-                   CASE WHEN mr.message_id IS NOT NULL THEN 1 ELSE 0 END as is_read_by_other
+                   CASE WHEN mr.message_id IS NOT NULL THEN 1 ELSE 0 END as is_read_by_other,
+                   m.reply_to_id,
+                   parent.body_enc as reply_body_enc,
+                   parent.nonce as reply_nonce,
+                   parent.type as reply_type,
+                   parent_u.username as reply_username
             FROM messages m
             JOIN users u ON m.user_id = u.id
             LEFT JOIN message_reads mr ON m.id = mr.message_id AND mr.user_id != m.user_id
+            LEFT JOIN messages parent ON m.reply_to_id = parent.id
+            LEFT JOIN users parent_u ON parent.user_id = parent_u.id
             WHERE m.convo_id = ? AND m.deleted = 0
             ORDER BY m.created_at ASC
             LIMIT 500
@@ -1222,6 +1257,7 @@ function handleApi(): void
         $socketId = $input['socket_id'] ?? null;
         $type = $input['type'] ?? 'text';
         $attachmentId = $input['attachment_id'] ?? null;
+        $replyToId = isset($input['reply_to_id']) ? (int)$input['reply_to_id'] : null;
 
         if ($type === 'image' && empty($body)) {
             $body = '📷 Image';
@@ -1240,9 +1276,26 @@ function handleApi(): void
         }
         $enc = encryptMessage($body);
         $now = gmdate('Y-m-d H:i:s');
-        $stmt = $db->prepare("INSERT INTO messages (convo_id, user_id, body_enc, nonce, created_at, type, attachment_id) VALUES (?, ?, ?, ?, ?, ?, ?)");
-        $stmt->execute([$convoId, $user['id'], $enc['ciphertext'], $enc['nonce'], $now, $type, $attachmentId]);
+        $stmt = $db->prepare("INSERT INTO messages (convo_id, user_id, body_enc, nonce, created_at, type, attachment_id, reply_to_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        $stmt->execute([$convoId, $user['id'], $enc['ciphertext'], $enc['nonce'], $now, $type, $attachmentId, $replyToId]);
         $messageId = (int)$db->lastInsertId();
+
+        // Fetch reply data for Pusher event
+        $replyData = null;
+        if ($replyToId) {
+            $replyStmt = $db->prepare("SELECT m.body_enc, m.nonce, m.type, u.username FROM messages m JOIN users u ON m.user_id = u.id WHERE m.id = ?");
+            $replyStmt->execute([$replyToId]);
+            $parentMsg = $replyStmt->fetch();
+            if ($parentMsg) {
+                $parentBody = decryptMessage($parentMsg['body_enc'], $parentMsg['nonce']);
+                $replyData = [
+                    'id' => $replyToId,
+                    'username' => $parentMsg['username'],
+                    'body' => $parentBody ?? '[Message deleted]',
+                    'type' => $parentMsg['type'] ?? 'text'
+                ];
+            }
+        }
 
         triggerPusherEvent(
             "private-conversation-{$convoId}",
@@ -1260,7 +1313,8 @@ function handleApi(): void
                     'is_read_by_other' => false,
                     'is_mine' => false,
                     'type' => $type,
-                    'attachment_id' => $attachmentId
+                    'attachment_id' => $attachmentId,
+                    'reply_to' => $replyData
                 ],
                 'convo_id' => $convoId
             ],
@@ -1354,10 +1408,17 @@ function handleApi(): void
         $stmt = $db->prepare("
             SELECT m.id, m.convo_id, m.user_id, m.body_enc, m.nonce, m.created_at, m.delivered_at, m.type, m.attachment_id,
                    u.username, u.is_verified,
-                   CASE WHEN mr.message_id IS NOT NULL THEN 1 ELSE 0 END as is_read_by_other
+                   CASE WHEN mr.message_id IS NOT NULL THEN 1 ELSE 0 END as is_read_by_other,
+                   m.reply_to_id,
+                   parent.body_enc as reply_body_enc,
+                   parent.nonce as reply_nonce,
+                   parent.type as reply_type,
+                   parent_u.username as reply_username
             FROM messages m
             JOIN users u ON m.user_id = u.id
             LEFT JOIN message_reads mr ON m.id = mr.message_id AND mr.user_id != m.user_id
+            LEFT JOIN messages parent ON m.reply_to_id = parent.id
+            LEFT JOIN users parent_u ON parent.user_id = parent_u.id
             WHERE m.convo_id = ? AND m.id > ? AND m.deleted = 0
             ORDER BY m.created_at ASC
             LIMIT ?
@@ -1399,12 +1460,18 @@ function handleApi(): void
         $partnerStatus = $stmt->fetch();
         $lastActive = $partnerStatus ? $partnerStatus['last_active_at'] : null;
 
+        // Check if partner typed in the last 4 seconds
+        $typingStmt = $db->prepare("SELECT 1 FROM convo_members WHERE convo_id = ? AND user_id != ? AND last_typed_at > datetime('now', '-4 seconds')");
+        $typingStmt->execute([$convoId, $user['id']]);
+        $isPartnerTyping = (bool)$typingStmt->fetch();
+
         $resultWithReactions = attachReactionsToMessages($db, $result);
         jsonResponse([
             'messages' => $resultWithReactions,
             'status_updates' => $statusUpdates,
             'deleted_ids' => $deletedIds,
-            'partner_last_active' => $lastActive
+            'partner_last_active' => $lastActive,
+            'partner_is_typing' => $isPartnerTyping
         ]);
     }
 
@@ -1819,6 +1886,11 @@ function handleApi(): void
             jsonResponse(['error' => 'Unauthorized'], 403);
         }
 
+        // Save typing status to DB (for polling users)
+        $db->prepare("UPDATE convo_members SET last_typed_at = datetime('now') WHERE convo_id = ? AND user_id = ?")
+            ->execute([$conversationId, $user['id']]);
+
+        // Trigger Pusher event (for realtime users)
         triggerPusherEvent(
             "private-conversation-{$conversationId}",
             'user-typing',
@@ -2249,24 +2321,54 @@ header("X-Frame-Options: DENY");
         }
 
         /* Reaction Trigger Button */
-        .reaction-trigger-btn {
+        .reaction-trigger-btn,
+        .reply-trigger-btn {
+            margin-bottom: 0 !important;
+            /* Removes bottom margin causing misalignment */
+            padding: 4px;
+            /* Tighter padding */
             opacity: 0;
             transition: opacity 0.2s;
-            padding: 8px;
-            /* Increased padding */
             cursor: pointer;
             color: var(--text-tertiary);
             display: flex;
             align-items: center;
-            z-index: 10;
-            /* Ensure it's on top */
-            margin-bottom: 8px;
-            /* Optional: A small nudge to balance the timestamp height */
+            /* Centers icon inside button */
+            height: 28px;
+            /* Fixed height to match alignment */
         }
 
+        /* Style for the New Reply Icon (Stroke based) */
+        .reply-trigger-btn svg {
+            width: 18px;
+            height: 18px;
+            stroke: currentColor;
+            /* vital for the new icon */
+            fill: none !important;
+            /* vital so it doesn't look like a black blob */
+            stroke-width: 2;
+        }
+
+        /* Make sure the reaction icon still looks right */
+        .reaction-trigger-btn svg {
+            width: 18px;
+            height: 18px;
+            fill: currentColor;
+        }
+
+        /* Ensure icons show on hover or on mobile */
         .message-row:hover .reaction-trigger-btn,
+        .message-row:hover .reply-trigger-btn,
         .message-row.reaction-active .reaction-trigger-btn {
             opacity: 1;
+        }
+
+        @media (hover: none) {
+
+            .reaction-trigger-btn,
+            .reply-trigger-btn {
+                opacity: 1;
+            }
         }
 
         /* Incoming Row Layout */
@@ -2293,31 +2395,102 @@ header("X-Frame-Options: DENY");
             /* Make it blue */
         }
 
-        /* Always show on touch devices */
+        /* WRAPPER: Stacks the Bubble Row on top of the Time/Status */
+        .message-content-wrapper {
+            display: flex;
+            flex-direction: column;
+            /* Vertical stack */
+            max-width: 75%;
+            width: fit-content;
+            position: relative;
+        }
+
+        /* OUTGOING: Aligns everything to the right */
+        .outgoing .message-content-wrapper {
+            align-items: flex-end;
+        }
+
+        /* INCOMING: Aligns everything to the left */
+        .incoming .message-content-wrapper {
+            align-items: flex-start;
+        }
+
+        /* NEW ROW: Holds Bubble + Icons Side-by-Side */
+        .message-interaction-row {
+            display: flex;
+            align-items: center;
+            /* ✅ PERFECT VERTICAL CENTERING */
+            gap: 6px;
+            /* Space between bubble and icons */
+            width: fit-content;
+        }
+
+        /* OUTGOING ROW: Reverses order so icons appear on the left of bubble */
+        .outgoing .message-interaction-row {
+            flex-direction: row-reverse;
+        }
+
+        /* Fix Action Buttons container */
+        .message-actions {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            opacity: 0;
+            /* Hide by default */
+            transition: opacity 0.2s;
+        }
+
+        /* Hover effects to show icons */
+        .message-row:hover .message-actions,
+        .message-actions:hover {
+            opacity: 1;
+        }
+
         @media (hover: none) {
-            .reaction-trigger-btn {
+            .message-actions {
                 opacity: 1;
             }
         }
 
-        .message-content-wrapper {
+        /* Ensure buttons have no extra margin dragging them down */
+        .reaction-trigger-btn,
+        .reply-trigger-btn {
+            margin: 0 !important;
+            padding: 4px;
+            height: 28px;
             display: flex;
             align-items: center;
-            /* FIX: Center alignment for stable positioning */
-            gap: 8px;
+            justify-content: center;
+        }
+
+        /* Optimistic UI Styles */
+        .message-bubble.uploading {
+            opacity: 0.8;
             position: relative;
-
-            /* ADD THESE LINES */
-            max-width: 75%;
-            width: fit-content;
         }
 
-        .incoming .message-content-wrapper {
-            flex-direction: row;
+        .upload-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.4);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 12px;
         }
 
-        .outgoing .message-content-wrapper {
-            flex-direction: row-reverse;
+        .progress-ring {
+            width: 40px;
+            height: 40px;
+        }
+
+        .progress-ring__circle {
+            transition: stroke-dashoffset 0.1s;
+            transform: rotate(-90deg);
+            transform-origin: 50% 50%;
         }
 
         /* ========================================
@@ -3184,6 +3357,7 @@ header("X-Frame-Options: DENY");
    COMPOSER
    ======================================== */
         .composer {
+            position: relative;
             display: -webkit-box;
             display: -webkit-flex;
             display: -ms-flexbox;
@@ -3197,6 +3371,151 @@ header("X-Frame-Options: DENY");
             background: var(--bg);
             border-top: 1px solid var(--divider);
             gap: 8px;
+        }
+
+        /* Reply Composer Preview */
+        .reply-composer-preview {
+            position: absolute;
+            bottom: 100%;
+            left: 0;
+            right: 0;
+            background: var(--bg-secondary);
+            padding: 10px 16px;
+            border-top: 1px solid var(--divider);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 10;
+        }
+
+        .reply-info {
+            display: flex;
+            flex-direction: column;
+            font-size: 13px;
+            border-left: 3px solid var(--accent);
+            padding-left: 10px;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .reply-label {
+            font-weight: 600;
+            color: var(--accent);
+            font-size: 12px;
+        }
+
+        .reply-text-truncate {
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .close-reply-btn {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: transparent;
+            color: var(--text-secondary);
+            flex-shrink: 0;
+        }
+
+        .close-reply-btn:hover {
+            background: var(--bg);
+        }
+
+        .close-reply-btn svg {
+            width: 18px;
+            height: 18px;
+            fill: currentColor;
+        }
+
+        /* Message Reply Context (inside bubble) */
+        .message-reply-context {
+            background: rgba(0, 0, 0, 0.06);
+            padding: 8px 10px;
+            border-radius: 8px;
+            margin-bottom: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            border-left: 3px solid var(--divider);
+            opacity: 0.9;
+        }
+
+        .message-reply-context:hover {
+            opacity: 1;
+        }
+
+        .bubble-outgoing .message-reply-context {
+            background: rgba(0, 0, 0, 0.12);
+            color: rgba(255, 255, 255, 0.95);
+            border-left-color: rgba(255, 255, 255, 0.5);
+        }
+
+        .reply-header {
+            font-size: 11px;
+            font-weight: 600;
+            margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .reply-icon {
+            width: 12px;
+            height: 12px;
+            fill: currentColor;
+        }
+
+        .reply-body {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 200px;
+        }
+
+        /* Reply Trigger Button */
+        .reply-trigger-btn {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            color: var(--text-secondary);
+            background: transparent;
+            transition: background 0.15s;
+        }
+
+        .reply-trigger-btn:hover {
+            background: var(--bg-secondary);
+        }
+
+        .reply-trigger-btn svg {
+            width: 16px;
+            height: 16px;
+            fill: currentColor;
+        }
+
+        /* Flash highlight for scrolled-to message */
+        .flash-highlight {
+            animation: flashHighlight 1.5s ease-out;
+        }
+
+        @keyframes flashHighlight {
+
+            0%,
+            30% {
+                background-color: rgba(var(--accent-rgb, 0, 132, 255), 0.3);
+            }
+
+            100% {
+                background-color: transparent;
+            }
         }
 
         .composer-input-wrap {
@@ -4221,6 +4540,7 @@ header("X-Frame-Options: DENY");
                         </div>
                         <div v-for="(m, index) in messages"
                             v-bind:key="m.id"
+                            :id="'msg-'+m.id"
                             class="message-row"
                             v-bind:class="{
                                  outgoing: m.is_mine, 
@@ -4238,11 +4558,31 @@ header("X-Frame-Options: DENY");
                             </div>
 
                             <div class="message-content-wrapper">
-                                <div class="bubble-group">
+                                <div class="message-interaction-row">
                                     <div class="message-bubble" v-bind:class="{'bubble-incoming': !m.is_mine, 'bubble-outgoing': m.is_mine, 'emoji-msg': isOnlyEmoji(m.body), 'image-msg': m.type === 'image'}">
 
-                                        <div v-if="m.type === 'image'" class="message-image">
-                                            <img :src="'TeleCDN.php?action=view&id=' + m.attachment_id" alt="Image" @click="window.open('TeleCDN.php?action=view&id=' + m.attachment_id, '_blank')">
+                                        <div v-if="m.reply_to" class="message-reply-context" v-on:click.stop="scrollToMessage(m.reply_to.id)">
+                                            <div class="reply-header">
+                                                <svg class="reply-icon" viewBox="0 0 24 24">
+                                                    <path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z" />
+                                                </svg>
+                                                <span>{{ m.reply_to.username }}</span>
+                                            </div>
+                                            <div class="reply-body">{{ m.reply_to.type === 'image' ? '📷 Photo' : m.reply_to.body }}</div>
+                                        </div>
+
+                                        <div v-if="m.type === 'image'" class="message-image" v-bind:class="{uploading: m.is_uploading}">
+                                            <img :src="m.local_url ? m.local_url : 'TeleCDN.php?action=view&id=' + m.attachment_id"
+                                                alt="Image"
+                                                @click="!m.is_uploading && window.open('TeleCDN.php?action=view&id=' + m.attachment_id, '_blank')">
+
+                                            <div v-if="m.is_uploading" class="upload-overlay">
+                                                <svg class="progress-ring" width="40" height="40">
+                                                    <circle class="progress-ring__circle" stroke="white" stroke-width="3" fill="transparent" r="16" cx="20" cy="20"
+                                                        :stroke-dasharray="16 * 2 * 3.14159"
+                                                        :stroke-dashoffset="(16 * 2 * 3.14159) - ((m.progress || 0) / 100 * (16 * 2 * 3.14159))" />
+                                                </svg>
+                                            </div>
                                         </div>
 
                                         <div class="message-text" v-bind:style="{fontSize: fontSizePx}">{{ m.body }}</div>
@@ -4259,70 +4599,90 @@ header("X-Frame-Options: DENY");
                                         </div>
                                     </div>
 
-                                    <div class="message-meta">
-                                        <!-- Removed time/status from here for now, or keep them? 
-                                             Request said "Move Status Checkmark to Side (Outgoing)" and "Move Avatar to Bottom-Left (Incoming)"
-                                             It also said "Time & Status outside the bubble" in CSS previously.
-                                             Let's re-add status OUTSIDE bubble for outgoing.
-                                        -->
-                                        <span v-if="m.is_mine" class="message-status" v-bind:class="{read: m.is_read_by_other, delivered: m.is_delivered && !m.is_read_by_other, sent: !m.is_delivered}">
-                                            <svg v-if="m.is_read_by_other" viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
-                                                <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41zM.41 13.41L6 19l1.41-1.41L1.83 12 .41 13.41z" />
+                                    <div class="message-actions">
+                                        <div class="reaction-trigger-btn" v-on:click.stop="toggleReactionPicker(m)">
+                                            <svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;color:var(--text-tertiary);">
+                                                <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z" />
                                             </svg>
-                                            <svg v-else-if="m.is_delivered" viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
-                                                <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41z" />
+                                        </div>
+                                        <div class="reply-trigger-btn" v-on:click.stop="startReply(m)" title="Reply">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-reply" style="width:18px;height:18px;color:var(--text-tertiary);">
+                                                <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+                                                <path d="m9 17-5-5 5-5" />
                                             </svg>
-                                            <svg v-else viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
-                                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
-                                            </svg>
-                                        </span>
+                                        </div>
                                     </div>
                                 </div>
 
-                                <div class="reaction-trigger-btn" v-on:click.stop="toggleReactionPicker(m)">
-                                    <svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;">
-                                        <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z" />
-                                    </svg>
+                                <div class="message-meta">
+                                    <span class="message-time-text">{{ formatTime(m.created_at) }}</span>
+                                    <span v-if="m.is_mine" class="message-status" v-bind:class="{read: m.is_read_by_other, delivered: m.is_delivered && !m.is_read_by_other, sent: !m.is_delivered}">
+                                        <svg v-if="m.is_read_by_other" viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
+                                            <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41zM.41 13.41L6 19l1.41-1.41L1.83 12 .41 13.41z" />
+                                        </svg>
+                                        <svg v-else-if="m.is_delivered" viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
+                                            <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41z" />
+                                        </svg>
+                                        <svg v-else viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
+                                            <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+                                        </svg>
+                                    </span>
                                 </div>
                             </div>
                         </div>
                         <div v-if="typingIndicator" class="message-row incoming">
+                            <div class="message-avatar" style="align-self: flex-end; margin-right: 8px; margin-bottom: 2px;">
+                                <div class="avatar avatar-sm" style="width: 28px; height: 28px;">
+                                    {{ getInitial(currentConvo.other_username) }}
+                                </div>
+                            </div>
+
                             <div class="typing-indicator">
                                 <div class="typing-dot"></div>
                                 <div class="typing-dot"></div>
                                 <div class="typing-dot"></div>
                             </div>
                         </div>
-                    </div>
 
-                    <form class="composer" v-on:submit="sendMessage">
-                        <button class="icon-btn-sm" type="button" v-on:click.stop="showReportModal = true" style="color: var(--accent);">
-                            <svg viewBox="0 0 24 24" style="width: 22px; height: 22px; fill: currentColor;">
-                                <path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z" />
-                            </svg>
-                        </button>
-
-                        <div class="composer-input-wrap">
-                            <input class="composer-input" type="text" v-model="messageInput" placeholder="Aa">
-
-                            <button type="button" class="composer-img-btn" v-on:click="$refs.fileInputMobile.click()">
-                                <svg viewBox="0 0 24 24" style="width: 20px; height: 20px; fill: currentColor;">
-                                    <path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z" />
+                        <form class="composer" v-on:submit="sendMessage">
+                            <div v-if="replyingTo" class="reply-composer-preview">
+                                <div class="reply-info">
+                                    <span class="reply-label">Replying to {{ replyingTo.username }}</span>
+                                    <span class="reply-text-truncate">{{ replyingTo.type === 'image' ? '📷 Photo' : replyingTo.body }}</span>
+                                </div>
+                                <button type="button" class="close-reply-btn" v-on:click="replyingTo = null">
+                                    <svg viewBox="0 0 24 24">
+                                        <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+                                    </svg>
+                                </button>
+                            </div>
+                            <button class="icon-btn-sm" type="button" v-on:click.stop="showReportModal = true" style="color: var(--accent);">
+                                <svg viewBox="0 0 24 24" style="width: 22px; height: 22px; fill: currentColor;">
+                                    <path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z" />
                                 </svg>
                             </button>
-                            <input type="file" ref="fileInputMobile" style="display: none" accept="image/*" v-on:change="handleFileUpload">
-                        </div>
 
-                        <button class="send-btn" type="submit" style="background: transparent; color: var(--accent); width: auto; height: auto;">
-                            <svg v-if="messageInput.trim()" viewBox="0 0 24 24" style="width: 24px; height: 24px; fill: currentColor;">
-                                <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
-                            </svg>
-                            <svg v-else viewBox="0 0 24 24" style="width: 24px; height: 24px; fill: currentColor;">
-                                <path d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-1.91l-.01-.01L23 10z" />
-                            </svg>
-                        </button>
-                    </form>
-                </div>
+                            <div class="composer-input-wrap">
+                                <input class="composer-input" type="text" v-model="messageInput" placeholder="Aa" v-on:input="handleTyping">
+
+                                <button type="button" class="composer-img-btn" v-on:click="$refs.fileInputMobile.click()">
+                                    <svg viewBox="0 0 24 24" style="width: 20px; height: 20px; fill: currentColor;">
+                                        <path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z" />
+                                    </svg>
+                                </button>
+                                <input type="file" ref="fileInputMobile" style="display: none" accept="image/*" v-on:change="handleFileUpload">
+                            </div>
+
+                            <button class="send-btn" type="submit" style="background: transparent; color: var(--accent); width: auto; height: auto;">
+                                <svg v-if="messageInput.trim()" viewBox="0 0 24 24" style="width: 24px; height: 24px; fill: currentColor;">
+                                    <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+                                </svg>
+                                <svg v-else viewBox="0 0 24 24" style="width: 24px; height: 24px; fill: currentColor;">
+                                    <path d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-1.91l-.01-.01L23 10z" />
+                                </svg>
+                            </button>
+                        </form>
+                    </div>
             </template>
 
             <!-- Desktop: Two Column Layout -->
@@ -4442,16 +4802,34 @@ header("X-Frame-Options: DENY");
                                     <div class="empty-state-title">Start the conversation!</div>
                                     <div class="empty-state-text">Send a message to begin</div>
                                 </div>
-                                <div v-for="m in messages" v-bind:key="m.id" class="message-row" v-bind:class="{outgoing: m.is_mine, incoming: !m.is_mine, 'reaction-active': activeReactionMessageId === m.id}" @mouseleave="activeReactionMessageId = null">
+                                <div v-for="m in messages" v-bind:key="m.id" :id="'msg-'+m.id" class="message-row" v-bind:class="{outgoing: m.is_mine, incoming: !m.is_mine, 'reaction-active': activeReactionMessageId === m.id}" @mouseleave="activeReactionMessageId = null">
 
                                     <div class="message-content-wrapper">
-
-                                        <div class="bubble-group">
-
+                                        <div class="message-interaction-row">
                                             <div class="message-bubble" v-bind:class="{'bubble-incoming': !m.is_mine, 'bubble-outgoing': m.is_mine, 'emoji-msg': isOnlyEmoji(m.body), 'image-msg': m.type === 'image'}">
 
-                                                <div v-if="m.type === 'image'" class="message-image">
-                                                    <img :src="'TeleCDN.php?action=view&id=' + m.attachment_id" alt="Image" @click="window.open('TeleCDN.php?action=view&id=' + m.attachment_id, '_blank')">
+                                                <div v-if="m.reply_to" class="message-reply-context" v-on:click.stop="scrollToMessage(m.reply_to.id)">
+                                                    <div class="reply-header">
+                                                        <svg class="reply-icon" viewBox="0 0 24 24">
+                                                            <path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z" />
+                                                        </svg>
+                                                        <span>{{ m.reply_to.username }}</span>
+                                                    </div>
+                                                    <div class="reply-body">{{ m.reply_to.type === 'image' ? '📷 Photo' : m.reply_to.body }}</div>
+                                                </div>
+
+                                                <div v-if="m.type === 'image'" class="message-image" v-bind:class="{uploading: m.is_uploading}">
+                                                    <img :src="m.local_url ? m.local_url : 'TeleCDN.php?action=view&id=' + m.attachment_id"
+                                                        alt="Image"
+                                                        @click="!m.is_uploading && window.open('TeleCDN.php?action=view&id=' + m.attachment_id, '_blank')">
+
+                                                    <div v-if="m.is_uploading" class="upload-overlay">
+                                                        <svg class="progress-ring" width="40" height="40">
+                                                            <circle class="progress-ring__circle" stroke="white" stroke-width="3" fill="transparent" r="16" cx="20" cy="20"
+                                                                :stroke-dasharray="16 * 2 * 3.14159"
+                                                                :stroke-dashoffset="(16 * 2 * 3.14159) - ((m.progress || 0) / 100 * (16 * 2 * 3.14159))" />
+                                                        </svg>
+                                                    </div>
                                                 </div>
 
                                                 <div class="message-text" v-bind:style="{fontSize: fontSizePx}">{{ m.body }}</div>
@@ -4468,31 +4846,44 @@ header("X-Frame-Options: DENY");
                                                 </div>
                                             </div>
 
-                                            <div class="message-meta">
-                                                <span class="message-time-text">{{ formatTime(m.created_at) }}</span>
-
-                                                <span v-if="m.is_mine" class="message-status" v-bind:class="{read: m.is_read_by_other, delivered: m.is_delivered && !m.is_read_by_other, sent: !m.is_delivered}">
-                                                    <svg v-if="m.is_read_by_other" viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
-                                                        <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41zM.41 13.41L6 19l1.41-1.41L1.83 12 .41 13.41z" />
+                                            <div class="message-actions">
+                                                <div class="reaction-trigger-btn" v-on:click.stop="toggleReactionPicker(m)">
+                                                    <svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;color:var(--text-tertiary);">
+                                                        <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z" />
                                                     </svg>
-                                                    <svg v-else-if="m.is_delivered" viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
-                                                        <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41z" />
+                                                </div>
+                                                <div class="reply-trigger-btn" v-on:click.stop="startReply(m)" title="Reply">
+                                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-reply" style="width:18px;height:18px;color:var(--text-tertiary);">
+                                                        <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+                                                        <path d="m9 17-5-5 5-5" />
                                                     </svg>
-                                                    <svg v-else viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
-                                                        <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
-                                                    </svg>
-                                                </span>
+                                                </div>
                                             </div>
-
                                         </div>
-                                        <div class="reaction-trigger-btn" v-on:click.stop="toggleReactionPicker(m)">
-                                            <svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;">
-                                                <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z" />
-                                            </svg>
+
+                                        <div class="message-meta">
+                                            <span class="message-time-text">{{ formatTime(m.created_at) }}</span>
+                                            <span v-if="m.is_mine" class="message-status" v-bind:class="{read: m.is_read_by_other, delivered: m.is_delivered && !m.is_read_by_other, sent: !m.is_delivered}">
+                                                <svg v-if="m.is_read_by_other" viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
+                                                    <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41zM.41 13.41L6 19l1.41-1.41L1.83 12 .41 13.41z" />
+                                                </svg>
+                                                <svg v-else-if="m.is_delivered" viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
+                                                    <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41z" />
+                                                </svg>
+                                                <svg v-else viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;">
+                                                    <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+                                                </svg>
+                                            </span>
                                         </div>
                                     </div>
                                 </div>
                                 <div v-if="typingIndicator" class="message-row incoming">
+                                    <div class="message-avatar" style="align-self: flex-end; margin-right: 8px; margin-bottom: 2px;">
+                                        <div class="avatar avatar-sm" style="width: 28px; height: 28px;">
+                                            {{ getInitial(currentConvo.other_username) }}
+                                        </div>
+                                    </div>
+
                                     <div class="typing-indicator">
                                         <div class="typing-dot"></div>
                                         <div class="typing-dot"></div>
@@ -4502,6 +4893,17 @@ header("X-Frame-Options: DENY");
                             </div>
 
                             <form class="composer" v-on:submit="sendMessage">
+                                <div v-if="replyingTo" class="reply-composer-preview">
+                                    <div class="reply-info">
+                                        <span class="reply-label">Replying to {{ replyingTo.username }}</span>
+                                        <span class="reply-text-truncate">{{ replyingTo.type === 'image' ? '📷 Photo' : replyingTo.body }}</span>
+                                    </div>
+                                    <button type="button" class="close-reply-btn" v-on:click="replyingTo = null">
+                                        <svg viewBox="0 0 24 24">
+                                            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+                                        </svg>
+                                    </button>
+                                </div>
                                 <div class="composer-actions">
                                     <button class="icon-btn-sm" type="button" v-on:click="$refs.fileInputDesktop.click()">
                                         <svg viewBox="0 0 24 24">
@@ -5001,6 +5403,9 @@ header("X-Frame-Options: DENY");
                     activeReactionMessageId: null,
                     reactionEmojis: ['👍', '❤️', '😂', '😮', '😢', '😠'],
 
+                    // Reply
+                    replyingTo: null,
+
                     // UI States
                     showInviteModal: false,
                     inviteUrl: '',
@@ -5165,6 +5570,14 @@ header("X-Frame-Options: DENY");
 
                         var fontStack = val ? val.css_value : "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif";
                         root.style.setProperty('--font', fontStack);
+                    },
+
+                    // Add this to automatically scroll when typing indicator appears
+                    typingIndicator: function() {
+                        var self = this;
+                        this.$nextTick(function() {
+                            self.scrollToBottom();
+                        });
                     }
                 },
 
@@ -5635,7 +6048,13 @@ header("X-Frame-Options: DENY");
                         e.preventDefault();
                         var self = this;
                         var body = this.messageInput.trim();
-                        if (!body || !this.currentConvo) return;
+
+                        // If body is empty, user clicked the Like button -> Send Emoji
+                        if (!body) {
+                            body = '👍';
+                        }
+
+                        if (!this.currentConvo) return;
 
                         this.messageInput = '';
                         this.finishSendMessage(body, 'text', null);
@@ -5646,36 +6065,90 @@ header("X-Frame-Options: DENY");
                         var file = e.target.files[0];
                         if (!file) return;
 
+                        // 1. Create a local preview immediately
+                        var blobUrl = URL.createObjectURL(file);
+                        var tempId = 'temp_' + Date.now();
+
+                        // 2. Create a temporary message object
+                        var tempMsg = {
+                            id: tempId,
+                            convo_id: self.currentConvo.id,
+                            user_id: self.user.id,
+                            username: self.user.username,
+                            is_mine: true,
+                            type: 'image',
+                            body: '📷 Uploading...',
+                            attachment_id: null,
+                            local_url: blobUrl, // For immediate preview
+                            is_uploading: true, // Flag for UI
+                            progress: 0, // Progress tracker
+                            created_at: new Date().toISOString().replace('T', ' ').substring(0, 19)
+                        };
+
+                        // 3. Push to UI immediately
+                        self.messages.push(tempMsg);
+                        self.$nextTick(function() {
+                            self.scrollToBottom();
+                        });
+
+                        // 4. Perform Upload
                         var formData = new FormData();
                         formData.append('file', file);
 
                         var xhr = new XMLHttpRequest();
                         xhr.open('POST', 'TeleCDN.php?action=upload', true);
+
+                        // Track Progress
+                        xhr.upload.onprogress = function(e) {
+                            if (e.lengthComputable) {
+                                var percent = Math.round((e.loaded / e.total) * 100);
+                                tempMsg.progress = percent; // Updates the UI reactively
+                            }
+                        };
+
                         xhr.onload = function() {
                             if (xhr.status === 200) {
                                 try {
                                     var res = JSON.parse(xhr.responseText);
                                     if (res.ok) {
-                                        self.sendImageMessage(res.id);
+                                        // 5. Upload success: Send the actual message metadata to server
+                                        // We pass the tempId so we can swap it out cleanly if we wanted (or just update it)
+                                        self.finishSendMessage('', 'image', res.id, tempMsg);
                                     } else {
                                         self.showToast('Upload failed: ' + (res.error || 'Unknown'), 'error');
+                                        self.removeMessage(tempId);
                                     }
                                 } catch (e) {
                                     self.showToast('Invalid response', 'error');
+                                    self.removeMessage(tempId);
                                 }
                             } else {
                                 self.showToast('Upload error', 'error');
+                                self.removeMessage(tempId);
                             }
-                            e.target.value = '';
+                            e.target.value = ''; // Reset input
                         };
+
+                        xhr.onerror = function() {
+                            self.showToast('Network error during upload', 'error');
+                            self.removeMessage(tempId);
+                        };
+
                         xhr.send(formData);
+                    },
+
+                    // Helper to remove temp message on failure
+                    removeMessage: function(id) {
+                        this.messages = this.messages.filter(function(m) {
+                            return m.id !== id;
+                        });
                     },
 
                     sendImageMessage: function(attachmentId) {
                         this.finishSendMessage('', 'image', attachmentId);
                     },
 
-                    finishSendMessage: function(body, type, attachmentId) {
+                    finishSendMessage: function(body, type, attachmentId, tempMsg) {
                         var self = this;
                         if (!this.currentConvo) return;
 
@@ -5683,7 +6156,8 @@ header("X-Frame-Options: DENY");
                             convo_id: this.currentConvo.id,
                             body: body,
                             type: type,
-                            attachment_id: attachmentId
+                            attachment_id: attachmentId,
+                            reply_to_id: this.replyingTo ? this.replyingTo.id : null
                         };
 
                         if (this.pusherSocketId) {
@@ -5694,10 +6168,11 @@ header("X-Frame-Options: DENY");
                             if (err) {
                                 if (type === 'text') self.messageInput = body;
                                 self.showToast(err.error, 'error');
+                                if (tempMsg) self.removeMessage(tempMsg.id); // Remove temp if server failed
                                 return;
                             }
 
-                            self.messages.push({
+                            var finalMsgData = {
                                 id: result.message_id,
                                 convo_id: self.currentConvo.id,
                                 user_id: self.user.id,
@@ -5709,12 +6184,31 @@ header("X-Frame-Options: DENY");
                                 created_at: new Date().toISOString().replace('T', ' ').substring(0, 19),
                                 is_delivered: false,
                                 is_read_by_other: false,
-                                is_mine: true
-                            });
+                                is_mine: true,
+                                reply_to: self.replyingTo ? {
+                                    id: self.replyingTo.id,
+                                    username: self.replyingTo.username,
+                                    body: self.replyingTo.body,
+                                    type: self.replyingTo.type
+                                } : null
+                            };
 
-                            self.$nextTick(function() {
-                                self.scrollToBottom();
-                            });
+                            // Clear reply state after sending
+                            self.replyingTo = null;
+
+                            if (tempMsg) {
+                                // Update the existing temporary object in place
+                                tempMsg.id = finalMsgData.id;
+                                tempMsg.is_uploading = false; // Hides the progress circle
+                                tempMsg.attachment_id = attachmentId;
+                                // We keep tempMsg.local_url for a smoother look, or we could switch to CDN
+                                // tempMsg.local_url will still work fine
+                            } else {
+                                self.messages.push(finalMsgData);
+                                self.$nextTick(function() {
+                                    self.scrollToBottom();
+                                });
+                            }
                         });
                     },
 
@@ -5853,6 +6347,27 @@ header("X-Frame-Options: DENY");
                                 if (data.partner_last_active && self.currentConvo) {
                                     self.currentConvo.other_last_active = data.partner_last_active;
                                 }
+
+                                // Handle Polling Typing Status
+                                if (self.currentConvo) {
+                                    var partnerId = self.currentConvo.other_user_id;
+                                    var partnerName = self.currentConvo.other_username;
+
+                                    if (data.partner_is_typing) {
+                                        // Force typing indicator ON
+                                        if (!self.typingUsers[partnerId]) {
+                                            self.$set(self.typingUsers, partnerId, partnerName);
+                                            self.$nextTick(function() {
+                                                self.scrollToBottom();
+                                            });
+                                        }
+                                    } else {
+                                        // Force typing indicator OFF if it was set
+                                        if (self.typingUsers[partnerId]) {
+                                            self.$delete(self.typingUsers, partnerId);
+                                        }
+                                    }
+                                }
                             });
                         }, 2000);
                     },
@@ -5979,6 +6494,33 @@ header("X-Frame-Options: DENY");
                             this.activeReactionMessageId = null;
                         } else {
                             this.activeReactionMessageId = msg.id;
+                        }
+                    },
+
+                    startReply: function(message) {
+                        this.replyingTo = message;
+                        var self = this;
+                        this.$nextTick(function() {
+                            var input = self.isDesktop ?
+                                document.querySelector('.chat-view.desktop .composer-input') :
+                                document.querySelector('.chat-view .composer-input');
+                            if (input) input.focus();
+                        });
+                    },
+
+                    scrollToMessage: function(messageId) {
+                        var el = document.getElementById('msg-' + messageId);
+                        if (el) {
+                            el.scrollIntoView({
+                                behavior: 'smooth',
+                                block: 'center'
+                            });
+                            el.classList.add('flash-highlight');
+                            setTimeout(function() {
+                                el.classList.remove('flash-highlight');
+                            }, 1500);
+                        } else {
+                            this.showToast('Message is too old to view', 'info');
                         }
                     },
 
